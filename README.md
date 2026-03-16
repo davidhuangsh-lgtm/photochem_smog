@@ -1,3 +1,5 @@
+![ChemiClubAILab](ChemiClubAILab.png)
+
 # Photochemical Smog Simulator
 
 An interactive real-time simulation of **photochemical smog formation over a stylized urban environment**, built in **Rust** for the **“Chem is Life”** chemistry show — a collaboration between **AI-Lab** and **ChemiClub**.
