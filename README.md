@@ -572,15 +572,6 @@ That combination makes it a strong fit for a public-facing chemistry demonstrati
 ---
 
 # License / Use
-
-Add your preferred license here, for example:
-
-- MIT
-- Apache-2.0
-- All rights reserved for event/demo use
-
-Example placeholder:
-
 ```text
 Copyright (c) AI-Lab and ChemiClub
 For educational and demonstration use.
