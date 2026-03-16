@@ -7,13 +7,17 @@ mod chemistry;
 mod surrogate;
 
 use chemistry::{
-    humidity_factor, j1, mixing_coeff, solar_arc, temperature_factor, traffic_profile,
-    trapping_factor, ChemState, SmogParams, CHEM_DT, step_rk4,
+    humidity_factor, j1, mixing_coeff, solar_arc, step_rk4, temperature_factor, traffic_profile,
+    trapping_factor, ChemState, SmogParams, CHEM_DT,
 };
 use surrogate::SurrogateRes;
 
 const HISTORY_LEN: usize = 420;
 const MAX_CHEM_STEPS_PER_FRAME: usize = 24;
+const CAR_POOL: usize = 28;
+const TRAFFIC_SPIKE_DURATION_HOURS: f32 = 1.0;
+const TRAFFIC_SPIKE_BOOST: f64 = 0.24;
+const RESET_WARMUP_SECONDS: f64 = 120.0;
 
 fn main() {
     App::new()
@@ -48,6 +52,7 @@ struct SimState {
     time_of_day: f32,
     auto_advance: bool,
     paused: bool,
+    traffic_spike_remaining_hours: f32,
     clock_speed: f32,
     step_accumulator: f64,
     history: VecDeque<HistoryPoint>,
@@ -57,7 +62,7 @@ impl Default for SimState {
     fn default() -> Self {
         let params = SmogParams::default();
         let time_of_day = 7.2;
-        let chem = ChemState::urban_baseline(time_of_day as f64, &params);
+        let chem = seeded_atmosphere(time_of_day as f64, &params);
         let mut history = VecDeque::with_capacity(HISTORY_LEN);
         history.push_back(HistoryPoint {
             o3: chem.o3 as f32,
@@ -71,6 +76,7 @@ impl Default for SimState {
             time_of_day,
             auto_advance: true,
             paused: false,
+            traffic_spike_remaining_hours: 0.0,
             clock_speed: 180.0,
             step_accumulator: 0.0,
             history,
@@ -79,8 +85,44 @@ impl Default for SimState {
 }
 
 impl SimState {
+    fn traffic_spike_active(&self) -> bool {
+        self.traffic_spike_remaining_hours > 0.0
+    }
+
+    fn active_traffic_density(&self) -> f64 {
+        (self.params.traffic_density
+            + if self.traffic_spike_active() {
+                TRAFFIC_SPIKE_BOOST
+            } else {
+                0.0
+            })
+        .clamp(0.0, 1.0)
+    }
+
+    fn effective_params(&self) -> SmogParams {
+        let mut params = self.params.clone();
+        params.traffic_density = self.active_traffic_density();
+        params
+    }
+
+    fn start_traffic_spike(&mut self) {
+        self.traffic_spike_remaining_hours = TRAFFIC_SPIKE_DURATION_HOURS;
+    }
+
+    fn tick_interventions(&mut self) {
+        if self.traffic_spike_remaining_hours > 0.0 {
+            self.traffic_spike_remaining_hours =
+                (self.traffic_spike_remaining_hours - (CHEM_DT as f32 / 3600.0)).max(0.0);
+        }
+    }
+
+    fn clear_interventions(&mut self) {
+        self.traffic_spike_remaining_hours = 0.0;
+    }
+
     fn reset_atmosphere(&mut self) {
-        self.chem = ChemState::urban_baseline(self.time_of_day as f64, &self.params);
+        let params = self.effective_params();
+        self.chem = seeded_atmosphere(self.time_of_day as f64, &params);
         self.step_accumulator = 0.0;
         self.history.clear();
         self.push_history_point();
@@ -99,12 +141,53 @@ impl SimState {
     }
 }
 
-#[derive(Component)] struct SmogLayer;
-#[derive(Component)] struct No2Layer;
-#[derive(Component)] struct SkyBg;
-#[derive(Component)] struct SunMarker;
-#[derive(Component)] struct CloudLayer;
-#[derive(Component)] struct CarMarker { dir: f32 }
+fn seeded_atmosphere(time_of_day: f64, params: &SmogParams) -> ChemState {
+    let warmup_steps = (RESET_WARMUP_SECONDS / CHEM_DT).round() as usize;
+    let warmup_hours = RESET_WARMUP_SECONDS / 3600.0;
+    let mut hour = (time_of_day - warmup_hours).rem_euclid(24.0);
+    let mut state = ChemState::urban_baseline(hour, params);
+
+    for _ in 0..warmup_steps {
+        state = step_rk4(&state, CHEM_DT, hour, params);
+        hour = (hour + CHEM_DT / 3600.0).rem_euclid(24.0);
+    }
+
+    state
+}
+
+#[derive(Component)]
+struct SmogLayer;
+#[derive(Component)]
+struct No2Layer;
+#[derive(Component)]
+struct SkyBg;
+#[derive(Component)]
+struct SunMarker;
+#[derive(Component)]
+struct CloudLayer;
+#[derive(Component)]
+struct BuildingMarker {
+    shade: f32,
+}
+#[derive(Component)]
+struct BuildingWindow {
+    glow_seed: f32,
+}
+#[derive(Component)]
+struct CarMarker {
+    dir: f32,
+    slot: usize,
+}
+#[derive(Component, Clone, Copy)]
+struct CarLight {
+    kind: CarLightKind,
+}
+
+#[derive(Clone, Copy)]
+enum CarLightKind {
+    Headlight,
+    Taillight,
+}
 
 fn load_surrogate(mut res: ResMut<SurrogateRes>) {
     use surrogate::NNSurrogate;
@@ -182,15 +265,8 @@ fn setup_scene(mut commands: Commands) {
         (365.0, 300.0, 90.0),
         (525.0, 215.0, 76.0),
     ];
-    for &(x, h, w) in buildings {
-        commands.spawn((
-            Sprite {
-                color: Color::srgb(0.17, 0.18, 0.22),
-                custom_size: Some(Vec2::new(w, h)),
-                ..default()
-            },
-            Transform::from_xyz(x, -285.0 + h * 0.5, 3.0),
-        ));
+    for (index, &(x, h, w)) in buildings.iter().enumerate() {
+        spawn_building(&mut commands, index, x, h, w);
     }
 
     commands.spawn((
@@ -203,20 +279,98 @@ fn setup_scene(mut commands: Commands) {
         SunMarker,
     ));
 
-    for i in 0..12usize {
-        let x = -700.0 + i as f32 * 120.0;
-        let dir = if i % 2 == 0 { 1.0_f32 } else { -1.0 };
+    for slot in 0..CAR_POOL {
+        let lane_index = slot / 2;
+        let x = -760.0 + lane_index as f32 * 118.0;
+        let dir = if slot % 2 == 0 { 1.0_f32 } else { -1.0 };
         let y = if dir > 0.0 { -298.0 } else { -315.0 };
-        commands.spawn((
+        spawn_car(&mut commands, slot, x, y, dir);
+    }
+}
+
+fn spawn_building(commands: &mut Commands, index: usize, x: f32, h: f32, w: f32) {
+    let cols = ((w / 20.0).floor() as usize).max(2);
+    let rows = ((h / 34.0).floor() as usize).max(3);
+    let x_step = (w - 26.0).max(14.0) / cols as f32;
+    let y_step = (h - 28.0).max(18.0) / rows as f32;
+    let window_w = (x_step * 0.42).clamp(7.0, 14.0);
+    let window_h = (y_step * 0.44).clamp(10.0, 16.0);
+    let shade = 0.92 + index as f32 * 0.04;
+
+    commands
+        .spawn((
+            Sprite {
+                color: Color::srgb(0.17, 0.18, 0.22),
+                custom_size: Some(Vec2::new(w, h)),
+                ..default()
+            },
+            Transform::from_xyz(x, -285.0 + h * 0.5, 3.0),
+            BuildingMarker { shade },
+        ))
+        .with_children(|parent| {
+            let x_start = -w * 0.5 + 14.0;
+            let y_start = -h * 0.5 + 18.0;
+            for row in 0..rows {
+                for col in 0..cols {
+                    parent.spawn((
+                        Sprite {
+                            color: Color::srgba(1.0, 0.86, 0.58, 0.0),
+                            custom_size: Some(Vec2::new(window_w, window_h)),
+                            ..default()
+                        },
+                        Transform::from_xyz(
+                            x_start + col as f32 * x_step,
+                            y_start + row as f32 * y_step,
+                            0.2,
+                        ),
+                        BuildingWindow {
+                            glow_seed: 1.7 * index as f32 + 2.3 * row as f32 + 1.1 * col as f32,
+                        },
+                    ));
+                }
+            }
+        });
+}
+
+fn spawn_car(commands: &mut Commands, slot: usize, x: f32, y: f32, dir: f32) {
+    commands
+        .spawn((
             Sprite {
                 color: Color::srgba(0.62, 0.13, 0.12, 0.80),
-                custom_size: Some(Vec2::new(44.0, 16.0)),
+                custom_size: Some(Vec2::new(46.0, 16.0)),
                 ..default()
             },
             Transform::from_xyz(x, y, 4.0),
-            CarMarker { dir },
-        ));
-    }
+            CarMarker { dir, slot },
+        ))
+        .with_children(|parent| {
+            let head_x = if dir > 0.0 { 20.0 } else { -20.0 };
+            let tail_x = -head_x;
+            for offset in [-3.5_f32, 3.5_f32] {
+                parent.spawn((
+                    Sprite {
+                        color: Color::srgba(1.0, 0.95, 0.82, 0.0),
+                        custom_size: Some(Vec2::new(5.0, 3.0)),
+                        ..default()
+                    },
+                    Transform::from_xyz(head_x, offset, 0.2),
+                    CarLight {
+                        kind: CarLightKind::Headlight,
+                    },
+                ));
+                parent.spawn((
+                    Sprite {
+                        color: Color::srgba(0.98, 0.18, 0.16, 0.0),
+                        custom_size: Some(Vec2::new(4.5, 3.0)),
+                        ..default()
+                    },
+                    Transform::from_xyz(tail_x, offset, 0.2),
+                    CarLight {
+                        kind: CarLightKind::Taillight,
+                    },
+                ));
+            }
+        });
 }
 
 fn advance_chemistry(
@@ -236,12 +390,16 @@ fn advance_chemistry(
 
     let mut steps = 0usize;
     while state.step_accumulator >= CHEM_DT && steps < MAX_CHEM_STEPS_PER_FRAME {
-        let params = state.params.clone();
+        let params = state.effective_params();
         let hour = state.time_of_day as f64;
         let prev = state.chem.clone();
 
         let next = if surrogate.enabled {
-            surrogate.inner.as_mut().and_then(|nn| nn.predict(&prev, &params, hour)).unwrap_or_else(|| step_rk4(&prev, CHEM_DT, hour, &params))
+            surrogate
+                .inner
+                .as_mut()
+                .and_then(|nn| nn.predict(&prev, &params, hour))
+                .unwrap_or_else(|| step_rk4(&prev, CHEM_DT, hour, &params))
         } else {
             step_rk4(&prev, CHEM_DT, hour, &params)
         };
@@ -253,6 +411,7 @@ fn advance_chemistry(
                 state.time_of_day -= 24.0;
             }
         }
+        state.tick_interventions();
         state.step_accumulator -= CHEM_DT;
         state.push_history_point();
         steps += 1;
@@ -268,7 +427,16 @@ fn sync_visuals(
         Query<(&mut Sprite, &mut Transform), With<SmogLayer>>,
         Query<(&mut Sprite, &mut Transform), With<No2Layer>>,
         Query<(&mut Transform, &mut Sprite), With<SunMarker>>,
-        Query<(&CarMarker, &mut Transform, &mut Sprite)>,
+        Query<(&CarMarker, &mut Transform, &mut Sprite, &mut Visibility)>,
+        Query<
+            (
+                &mut Sprite,
+                Option<&BuildingMarker>,
+                Option<&BuildingWindow>,
+                Option<&CarLight>,
+            ),
+            Or<(With<BuildingMarker>, With<BuildingWindow>, With<CarLight>)>,
+        >,
     )>,
 ) {
     let o3_ppb = (state.chem.o3 as f32).clamp(0.0, 260.0);
@@ -276,19 +444,27 @@ fn sync_visuals(
     let hour = state.time_of_day as f64;
     let day_f = solar_arc(hour) as f32 * state.params.solar_flux as f32;
     let wind_f = state.params.wind_speed as f32;
-    let traffic_now = traffic_profile(hour, state.params.traffic_density, state.params.weekend_mode) as f32;
+    let active_density = state.active_traffic_density();
+    let traffic_now = traffic_profile(hour, active_density, state.params.weekend_mode) as f32;
     let trap = trapping_factor(state.params.inversion_strength, state.params.wind_speed) as f32;
     let humidity = state.params.humidity as f32;
+    let smog_f = (o3_ppb / 155.0).clamp(0.0, 1.0);
+    let no2_f = (no2_ppb / 120.0).clamp(0.0, 1.0);
+    let cloudiness =
+        (((1.12 - state.params.solar_flux as f32) / 0.92) + 0.25 * humidity).clamp(0.0, 1.0);
+    let ambient_brightness = ((0.08 + 0.92 * day_f.clamp(0.0, 1.0))
+        * (1.0 - 0.42 * smog_f - 0.20 * no2_f - 0.18 * cloudiness))
+        .clamp(0.06, 1.0);
+    let darkness = 1.0 - ambient_brightness;
 
     {
         let mut sky_q = visuals.p0();
         if let Ok(mut s) = sky_q.get_single_mut() {
-            let smog_f = (o3_ppb / 155.0).clamp(0.0, 1.0);
             let humid_tint = 0.08 * humidity;
             s.color = Color::srgb(
-                0.10 + 0.30 * day_f + 0.20 * smog_f,
-                0.16 + 0.52 * day_f - 0.14 * smog_f + humid_tint,
-                0.24 + 0.56 * day_f - 0.25 * smog_f + humid_tint,
+                0.08 + 0.26 * ambient_brightness + 0.16 * smog_f,
+                0.12 + 0.49 * ambient_brightness - 0.12 * smog_f + humid_tint,
+                0.18 + 0.54 * ambient_brightness - 0.20 * smog_f + humid_tint,
             );
         }
     }
@@ -296,7 +472,6 @@ fn sync_visuals(
     {
         let mut cloud_q = visuals.p1();
         if let Ok(mut c) = cloud_q.get_single_mut() {
-            let cloudiness = (((1.12 - state.params.solar_flux as f32) / 0.92) + 0.25 * humidity).clamp(0.0, 1.0);
             c.color = Color::srgba(0.96, 0.97, 0.99, 0.06 + 0.36 * cloudiness);
         }
     }
@@ -304,7 +479,8 @@ fn sync_visuals(
     {
         let mut smog_q = visuals.p2();
         if let Ok((mut s, mut t)) = smog_q.get_single_mut() {
-            let alpha = ((o3_ppb / 135.0) * (1.0 - 0.28 * wind_f) * (0.75 + 0.25 * trap)).clamp(0.0, 0.82);
+            let alpha =
+                ((o3_ppb / 135.0) * (1.0 - 0.28 * wind_f) * (0.75 + 0.25 * trap)).clamp(0.0, 0.82);
             let height = 165.0 + o3_ppb * 0.95 + trap * 48.0;
             s.color = Color::srgba(0.89, 0.79, 0.18, alpha);
             s.custom_size = Some(Vec2::new(1400.0, height));
@@ -330,16 +506,80 @@ fn sync_visuals(
             let angle = std::f32::consts::PI * frac;
             t.translation.x = -340.0 * angle.cos();
             t.translation.y = 300.0 * angle.sin() - 50.0;
-            t.scale = Vec3::splat(0.82 + 0.30 * state.params.solar_flux as f32 + 0.02 * (state.params.temperature_c as f32 - 25.0).max(0.0));
-            s.color = Color::srgba(1.0, 0.95, 0.60, (0.16 + 0.84 * day_f).clamp(0.0, 1.0));
+            t.scale = Vec3::splat(
+                0.82 + 0.30 * state.params.solar_flux as f32
+                    + 0.02 * (state.params.temperature_c as f32 - 25.0).max(0.0),
+            );
+            s.color = Color::srgba(
+                1.0,
+                0.95,
+                0.60,
+                ((0.10 + 0.84 * day_f) * (1.0 - 0.26 * smog_f)).clamp(0.0, 1.0),
+            );
         }
     }
 
-    let car_speed = 28.0 + 34.0 * traffic_now;
-    let car_alpha = (0.15 + 0.18 * state.params.traffic_density as f32 + 0.32 * traffic_now).clamp(0.18, 1.0);
+    let building_light_alpha = (0.08 + 0.98 * darkness + 0.28 * smog_f).clamp(0.0, 1.0);
+    let headlight_alpha = (0.02 + 1.05 * darkness + 0.50 * smog_f + 0.14 * no2_f).clamp(0.0, 1.0);
+    let taillight_alpha = (0.14 + 0.26 * darkness + 0.20 * smog_f).clamp(0.10, 0.82);
+    {
+        let mut scene_q = visuals.p6();
+        for (mut sprite, building, window, light) in scene_q.iter_mut() {
+            if let Some(building) = building {
+                let facade = (0.07 + 0.18 * ambient_brightness) * building.shade;
+                sprite.color = Color::srgb(
+                    (0.10 + 0.07 * facade).clamp(0.0, 1.0),
+                    (0.11 + 0.08 * facade).clamp(0.0, 1.0),
+                    (0.15 + 0.11 * facade).clamp(0.0, 1.0),
+                );
+                continue;
+            }
+
+            if let Some(window) = window {
+                let flicker =
+                    0.65 + 0.35 * (window.glow_seed + state.time_of_day * 0.35).sin().abs();
+                let occupancy = 0.40 + 0.60 * (window.glow_seed * 1.37).sin().abs();
+                let alpha = (building_light_alpha * flicker * occupancy).clamp(0.0, 0.98);
+                sprite.color =
+                    Color::srgba(1.0, 0.80 + 0.12 * flicker, 0.40 + 0.22 * flicker, alpha);
+                continue;
+            }
+
+            if let Some(light) = light {
+                match light.kind {
+                    CarLightKind::Headlight => {
+                        sprite.color = Color::srgba(1.0, 0.96, 0.84, headlight_alpha);
+                    }
+                    CarLightKind::Taillight => {
+                        sprite.color = Color::srgba(1.0, 0.18, 0.16, taillight_alpha);
+                    }
+                }
+            }
+        }
+    }
+
+    let traffic_visual = ((traffic_now - 0.08) / 1.70).clamp(0.0, 1.0);
+    let active_cars = if active_density < 0.03 {
+        0usize
+    } else {
+        ((CAR_POOL as f32) * traffic_visual.powf(0.85))
+            .round()
+            .clamp(1.0, CAR_POOL as f32) as usize
+    };
+    let car_speed = 20.0 + 28.0 * traffic_visual + 6.0 * ambient_brightness;
+    let car_alpha = (0.35 + 0.55 * traffic_visual).clamp(0.22, 1.0);
     {
         let mut car_q = visuals.p5();
-        for (car, mut t, mut s) in car_q.iter_mut() {
+        for (car, mut t, mut s, mut visibility) in car_q.iter_mut() {
+            let visible = car.slot < active_cars;
+            *visibility = if visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            if !visible {
+                continue;
+            }
             t.translation.x += car.dir * car_speed * time.delta_secs();
             if t.translation.x > 760.0 {
                 t.translation.x = -760.0;
@@ -347,7 +587,12 @@ fn sync_visuals(
             if t.translation.x < -760.0 {
                 t.translation.x = 760.0;
             }
-            s.color = Color::srgba(0.62, 0.13, 0.12, car_alpha);
+            s.color = Color::srgba(
+                (0.28 + 0.28 * ambient_brightness).clamp(0.0, 1.0),
+                (0.08 + 0.06 * ambient_brightness).clamp(0.0, 1.0),
+                (0.09 + 0.07 * ambient_brightness).clamp(0.0, 1.0),
+                car_alpha,
+            );
         }
     }
 }
@@ -386,8 +631,8 @@ fn render_ui(
 
                     ui.collapsing("Quick interventions", |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Traffic spike").clicked() {
-                                state.params.traffic_density = (state.params.traffic_density + 0.12).clamp(0.0, 1.0);
+                            if ui.button("Traffic spike (1 h)").clicked() {
+                                state.start_traffic_spike();
                             }
                             if ui.button("Cloud passes").clicked() {
                                 state.params.solar_flux = (state.params.solar_flux - 0.18).clamp(0.2, 1.5);
@@ -406,10 +651,18 @@ fn render_ui(
                                 state.reset_atmosphere();
                             }
                         });
+                        if state.traffic_spike_active() {
+                            ui.small(format!(
+                                "Traffic spike active for another {:.2} simulated hours.",
+                                state.traffic_spike_remaining_hours
+                            ));
+                        }
                     });
 
                     ui.separator();
                     ui.heading("Controls");
+                    let previous_time = state.time_of_day;
+                    let previous_weekend_mode = state.params.weekend_mode;
                     ui.add(egui::Slider::new(&mut state.params.traffic_density, 0.0..=1.0).text("Traffic density"));
                     ui.add(egui::Slider::new(&mut state.params.industrial_emissions, 0.0..=1.0).text("Industrial emissions"));
                     ui.add(egui::Slider::new(&mut state.params.solar_flux, 0.2..=1.5).text("Solar flux / heat"));
@@ -417,13 +670,27 @@ fn render_ui(
                     ui.add(egui::Slider::new(&mut state.params.temperature_c, 10.0..=40.0).text("Temperature (°C)"));
                     ui.add(egui::Slider::new(&mut state.params.humidity, 0.1..=1.0).text("Humidity"));
                     ui.add(egui::Slider::new(&mut state.params.inversion_strength, 0.0..=1.0).text("Inversion / trapping"));
-                    ui.checkbox(&mut state.params.weekend_mode, "Weekend traffic pattern");
-                    ui.add(egui::Slider::new(&mut state.time_of_day, 0.0..=24.0).text("Time of day (h)"));
+                    let weekend_response =
+                        ui.checkbox(&mut state.params.weekend_mode, "Weekend traffic pattern");
+                    let time_response = ui.add(
+                        egui::Slider::new(&mut state.time_of_day, 0.0..=24.0)
+                            .text("Time of day (h)"),
+                    );
                     ui.add(egui::Slider::new(&mut state.clock_speed, 30.0..=700.0).text("Sim speed (s/s)"));
                     ui.checkbox(&mut state.auto_advance, "Auto-advance clock");
-                    ui.checkbox(&mut state.paused, "Pause");
+                    if ui.button(if state.paused { "Resume simulation" } else { "Pause simulation" }).clicked() {
+                        state.paused = !state.paused;
+                    }
+                    let time_changed = time_response.changed()
+                        && (state.time_of_day - previous_time).abs() > f32::EPSILON;
+                    let weekend_changed =
+                        weekend_response.changed() && state.params.weekend_mode != previous_weekend_mode;
+                    if time_changed || weekend_changed {
+                        state.reset_atmosphere();
+                    }
                     ui.small("The right-hand control bar is now scrollable, so all controls remain reachable even with the expanded model.");
-                    ui.small("After large manual changes in time or regime, press Reset atmosphere to reseed a physically consistent starting state.");
+                    ui.small("Traffic now follows a daily cycle: very high in the morning and evening, medium around noon, and very low near midnight.");
+                    ui.small("Time-of-day and weekend-pattern changes now auto-reseed the air mass so the history does not jump from an inconsistent regime.");
 
                     ui.separator();
                     ui.heading("Solver");
@@ -454,7 +721,9 @@ fn render_ui(
                     ui.separator();
                     ui.heading("Drivers");
                     let hour = state.time_of_day as f64;
-                    let traffic_now = traffic_profile(hour, state.params.traffic_density, state.params.weekend_mode);
+                    let active_density = state.active_traffic_density();
+                    let traffic_now = traffic_profile(hour, active_density, state.params.weekend_mode);
+                    let live_params = state.effective_params();
                     let mix_now = mixing_coeff(hour, state.params.solar_flux, state.params.wind_speed, state.params.inversion_strength);
                     let daylight = solar_arc(hour) * state.params.solar_flux;
                     let temp_factor = temperature_factor(state.params.temperature_c);
@@ -462,6 +731,8 @@ fn render_ui(
                     let trap_factor = trapping_factor(state.params.inversion_strength, state.params.wind_speed);
                     ui.monospace(format!("Daylight factor      {:5.2}", daylight));
                     ui.monospace(format!("Photolysis j1        {:5.4} s^-1", j1(hour, state.params.solar_flux)));
+                    ui.monospace(format!("Base traffic density {:5.2}", state.params.traffic_density));
+                    ui.monospace(format!("Live traffic density {:5.2}", live_params.traffic_density));
                     ui.monospace(format!("Traffic activity     {:5.2}", traffic_now));
                     ui.monospace(format!("Mixing coeff         {:5.5} s^-1", mix_now));
                     ui.monospace(format!("Temp chemistry boost {:5.2}", temp_factor));
@@ -480,7 +751,18 @@ fn render_ui(
         });
 }
 
-fn apply_preset(state: &mut SimState, hour: f32, traffic: f64, solar: f64, wind: f64, temp_c: f64, humidity: f64, industry: f64, inversion: f64, weekend: bool) {
+fn apply_preset(
+    state: &mut SimState,
+    hour: f32,
+    traffic: f64,
+    solar: f64,
+    wind: f64,
+    temp_c: f64,
+    humidity: f64,
+    industry: f64,
+    inversion: f64,
+    weekend: bool,
+) {
     state.time_of_day = hour;
     state.params.traffic_density = traffic;
     state.params.solar_flux = solar;
@@ -490,6 +772,7 @@ fn apply_preset(state: &mut SimState, hour: f32, traffic: f64, solar: f64, wind:
     state.params.industrial_emissions = industry;
     state.params.inversion_strength = inversion;
     state.params.weekend_mode = weekend;
+    state.clear_interventions();
     state.reset_atmosphere();
 }
 
@@ -498,7 +781,10 @@ fn smog_index_label(o3: f64) -> (&'static str, egui::Color32) {
         0..=39 => ("Good", egui::Color32::from_rgb(90, 200, 90)),
         40..=69 => ("Watch", egui::Color32::from_rgb(210, 200, 70)),
         70..=99 => ("Smog building", egui::Color32::from_rgb(235, 150, 40)),
-        100..=139 => ("Unhealthy (sensitive)", egui::Color32::from_rgb(230, 105, 40)),
+        100..=139 => (
+            "Unhealthy (sensitive)",
+            egui::Color32::from_rgb(230, 105, 40),
+        ),
         _ => ("Unhealthy", egui::Color32::from_rgb(205, 55, 55)),
     }
 }
@@ -541,11 +827,19 @@ fn draw_history_plot(ui: &mut egui::Ui, history: &VecDeque<HistoryPoint>) {
     let painter = ui.painter();
 
     if history.len() < 2 {
-        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "History fills as the chemistry advances", egui::TextStyle::Body.resolve(ui.style()), egui::Color32::GRAY);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "History fills as the chemistry advances",
+            egui::TextStyle::Body.resolve(ui.style()),
+            egui::Color32::GRAY,
+        );
         return;
     }
 
-    let max_y = history.iter().fold(120.0_f32, |acc, p| acc.max(p.o3).max(p.no2).max(p.no).max(p.voc * 0.35));
+    let max_y = history.iter().fold(120.0_f32, |acc, p| {
+        acc.max(p.o3).max(p.no2).max(p.no).max(p.voc * 0.35)
+    });
 
     let to_pos = |i: usize, value: f32| {
         let x = rect.left() + rect.width() * (i as f32 / (history.len() - 1) as f32);
@@ -553,23 +847,71 @@ fn draw_history_plot(ui: &mut egui::Ui, history: &VecDeque<HistoryPoint>) {
         egui::pos2(x, y)
     };
 
-    painter.rect_stroke(
-        rect,
-        4.0,
-        egui::Stroke::new(1.0, egui::Color32::DARK_GRAY)
-    );
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::DARK_GRAY));
 
     for (series, color) in [
-        (history.iter().enumerate().map(|(i, p)| to_pos(i, p.o3)).collect::<Vec<_>>(), egui::Color32::from_rgb(220, 185, 60)),
-        (history.iter().enumerate().map(|(i, p)| to_pos(i, p.no2)).collect::<Vec<_>>(), egui::Color32::from_rgb(210, 100, 55)),
-        (history.iter().enumerate().map(|(i, p)| to_pos(i, p.no)).collect::<Vec<_>>(), egui::Color32::from_rgb(120, 205, 255)),
-        (history.iter().enumerate().map(|(i, p)| to_pos(i, p.voc * 0.35)).collect::<Vec<_>>(), egui::Color32::from_rgb(155, 110, 210)),
+        (
+            history
+                .iter()
+                .enumerate()
+                .map(|(i, p)| to_pos(i, p.o3))
+                .collect::<Vec<_>>(),
+            egui::Color32::from_rgb(220, 185, 60),
+        ),
+        (
+            history
+                .iter()
+                .enumerate()
+                .map(|(i, p)| to_pos(i, p.no2))
+                .collect::<Vec<_>>(),
+            egui::Color32::from_rgb(210, 100, 55),
+        ),
+        (
+            history
+                .iter()
+                .enumerate()
+                .map(|(i, p)| to_pos(i, p.no))
+                .collect::<Vec<_>>(),
+            egui::Color32::from_rgb(120, 205, 255),
+        ),
+        (
+            history
+                .iter()
+                .enumerate()
+                .map(|(i, p)| to_pos(i, p.voc * 0.35))
+                .collect::<Vec<_>>(),
+            egui::Color32::from_rgb(155, 110, 210),
+        ),
     ] {
         painter.add(egui::Shape::line(series, egui::Stroke::new(2.0, color)));
     }
 
-    painter.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, "O3", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_rgb(220, 185, 60));
-    painter.text(rect.left_top() + egui::vec2(38.0, 6.0), egui::Align2::LEFT_TOP, "NO2", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_rgb(210, 100, 55));
-    painter.text(rect.left_top() + egui::vec2(78.0, 6.0), egui::Align2::LEFT_TOP, "NO", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_rgb(120, 205, 255));
-    painter.text(rect.left_top() + egui::vec2(108.0, 6.0), egui::Align2::LEFT_TOP, "VOC x0.35", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_rgb(155, 110, 210));
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        "O3",
+        egui::TextStyle::Small.resolve(ui.style()),
+        egui::Color32::from_rgb(220, 185, 60),
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(38.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        "NO2",
+        egui::TextStyle::Small.resolve(ui.style()),
+        egui::Color32::from_rgb(210, 100, 55),
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(78.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        "NO",
+        egui::TextStyle::Small.resolve(ui.style()),
+        egui::Color32::from_rgb(120, 205, 255),
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(108.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        "VOC x0.35",
+        egui::TextStyle::Small.resolve(ui.style()),
+        egui::Color32::from_rgb(155, 110, 210),
+    );
 }
