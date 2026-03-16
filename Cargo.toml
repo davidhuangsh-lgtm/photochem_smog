@@ -1,0 +1,17 @@
+[package]
+name    = "photochem_smog"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+bevy      = "0.15"
+bevy_egui = "0.31"
+ort       = { version = "2.0.0-rc.12", features = ["ndarray"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
