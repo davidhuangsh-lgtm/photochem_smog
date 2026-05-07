@@ -14,7 +14,12 @@ impl NNSurrogate {
     }
 
     /// Predict one fixed 10-second chemistry step.
-    pub fn predict(&mut self, state: &ChemState, params: &SmogParams, hour: f64) -> Option<ChemState> {
+    pub fn predict(
+        &mut self,
+        state: &ChemState,
+        params: &SmogParams,
+        hour: f64,
+    ) -> Option<ChemState> {
         let data: Vec<f32> = vec![
             state.no2 as f32,
             state.no as f32,

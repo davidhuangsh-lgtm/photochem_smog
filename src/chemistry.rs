@@ -103,8 +103,10 @@ pub fn j1(hour: f64, solar_flux: f64) -> f64 {
 pub fn traffic_profile(hour: f64, traffic_density: f64, weekend_mode: bool) -> f64 {
     let weekend_scale = if weekend_mode { 0.68 } else { 1.0 };
     let base = (0.22 + 0.42 * traffic_density) * if weekend_mode { 0.78 } else { 1.0 };
-    let morning = (0.58 + 0.92 * traffic_density) * gaussian_wrap(hour, 8.0, if weekend_mode { 1.3 } else { 0.9 });
-    let evening = (0.44 + 0.74 * traffic_density) * gaussian_wrap(hour, 17.6, if weekend_mode { 1.4 } else { 1.1 });
+    let morning = (0.58 + 0.92 * traffic_density)
+        * gaussian_wrap(hour, 8.0, if weekend_mode { 1.3 } else { 0.9 });
+    let evening = (0.44 + 0.74 * traffic_density)
+        * gaussian_wrap(hour, 17.6, if weekend_mode { 1.4 } else { 1.1 });
     let midday = (0.10 + 0.18 * traffic_density) * gaussian_wrap(hour, 13.0, 2.4);
     weekend_scale * (base + morning + evening + midday)
 }
@@ -113,7 +115,8 @@ pub fn mixing_coeff(hour: f64, solar_flux: f64, wind_speed: f64, inversion_stren
     let midday_phase = ((hour - 8.5) / 8.5).clamp(0.0, 1.0);
     let mixed_day = (std::f64::consts::PI * midday_phase).sin().max(0.0);
     let inversion_drag = 1.0 - 0.72 * inversion_strength;
-    (K_MIX_BASE + K_MIX_DAY * mixed_day * solar_flux + K_MIX_WIND * wind_speed) * inversion_drag.max(0.18)
+    (K_MIX_BASE + K_MIX_DAY * mixed_day * solar_flux + K_MIX_WIND * wind_speed)
+        * inversion_drag.max(0.18)
 }
 
 pub fn trapping_factor(inversion_strength: f64, wind_speed: f64) -> f64 {
@@ -131,9 +134,17 @@ pub fn humidity_factor(humidity: f64) -> f64 {
 pub fn background_state(hour: f64, p: &SmogParams) -> ChemState {
     let weekend_bias = if p.weekend_mode { 0.85 } else { 1.0 };
     ChemState {
-        no2: (2.0 + 2.2 * gaussian_wrap(hour, 7.0, 1.8) + 5.0 * p.industrial_emissions * weekend_bias).clamp(0.5, 35.0),
-        no: (0.3 + 1.0 * gaussian_wrap(hour, 8.0, 1.0) + 0.8 * gaussian_wrap(hour, 18.0, 1.2)).clamp(0.0, 10.0),
-        o3: (10.0 + 16.0 * solar_arc(hour) * p.solar_flux + 11.0 * p.wind_speed + 3.0 * p.temperature_c / 30.0).clamp(4.0, 70.0),
+        no2: (2.0
+            + 2.2 * gaussian_wrap(hour, 7.0, 1.8)
+            + 5.0 * p.industrial_emissions * weekend_bias)
+            .clamp(0.5, 35.0),
+        no: (0.3 + 1.0 * gaussian_wrap(hour, 8.0, 1.0) + 0.8 * gaussian_wrap(hour, 18.0, 1.2))
+            .clamp(0.0, 10.0),
+        o3: (10.0
+            + 16.0 * solar_arc(hour) * p.solar_flux
+            + 11.0 * p.wind_speed
+            + 3.0 * p.temperature_c / 30.0)
+            .clamp(4.0, 70.0),
         voc: (16.0 + 9.0 * p.traffic_density + 28.0 * p.industrial_emissions).clamp(8.0, 130.0),
     }
 }
@@ -159,11 +170,17 @@ pub fn derivatives(y: &ChemState, hour: f64, p: &SmogParams) -> ChemState {
     let release = K_TRAP_RELEASE * p.inversion_strength * solar * (1.0 + p.temperature_c / 50.0);
 
     ChemState {
-        no2: (-r_photolysis + r_titration + r_voc_chain + e_nox * 0.28 + mix * (bg.no2 - y.no2) - K_NO2_DEP * y.no2 - release * (y.no2 - bg.no2))
+        no2: (-r_photolysis + r_titration + r_voc_chain + e_nox * 0.28 + mix * (bg.no2 - y.no2)
+            - K_NO2_DEP * y.no2
+            - release * (y.no2 - bg.no2))
             .clamp(-MAX_NO2, MAX_NO2),
-        no: (r_photolysis - r_titration - r_voc_chain + e_nox * 0.72 + mix * (bg.no - y.no) - release * (y.no - bg.no))
+        no: (r_photolysis - r_titration - r_voc_chain + e_nox * 0.72 + mix * (bg.no - y.no)
+            - release * (y.no - bg.no))
             .clamp(-MAX_NO, MAX_NO),
-        o3: (r_photolysis - r_titration + 0.72 * r_voc_chain + mix * (bg.o3 - y.o3) - K_O3_DEP * y.o3 - r_humidity_o3_loss + 0.010 * industrial * solar * temp_f)
+        o3: (r_photolysis - r_titration + 0.72 * r_voc_chain + mix * (bg.o3 - y.o3)
+            - K_O3_DEP * y.o3
+            - r_humidity_o3_loss
+            + 0.010 * industrial * solar * temp_f)
             .clamp(-MAX_O3, MAX_O3),
         voc: (-r_voc_loss + e_voc + mix * (bg.voc - y.voc) - 0.00005 * y.voc * p.humidity)
             .clamp(-MAX_VOC, MAX_VOC),
