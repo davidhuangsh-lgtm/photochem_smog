@@ -1,8 +1,38 @@
+![ChemiClubAILab](ChemiClubAILab.png)
+
 # Photochemical Smog Simulator
 
 An interactive real-time simulation of **photochemical smog formation over a stylized urban environment**, built in **Rust** for the **“Chem is Life”** chemistry show — a collaboration between **AI-Lab** and **ChemiClub**.
 
 This project demonstrates how **real atmospheric chemistry** and **machine learning surrogates** can be combined to create a fast, educational, visually engaging simulation.
+
+---
+
+## Card Game Mode
+
+The current app also includes a short **90-second policy-card game** built on top of the same smog simulation.
+
+In this mode, players try to keep two scores high:
+
+- **Air Safety**: how safe the air is during the round
+- **City Stability**: how much disruption the city can tolerate
+
+Players respond to incidents with policy cards. Air-focused cards reduce chemistry drivers such as NOx, VOCs, photolysis, or trapping, but they cost city stability. City-focused cards recover stability, but usually increase emissions or worsen chemistry. Health cards reduce exposure damage for a short time.
+
+Example incidents include:
+
+- Heat Wave
+- Traffic Jam
+- Factory Solvent Leak
+- Cold Snap
+- Temperature Inversion
+- Cloud Break
+- Festival Fireworks
+- Wind Shift
+
+The right-hand panel shows the active incident and the recommended counter. A mechanism view shows current chemical species as nodes and reaction rates as moving arrows, so players can see how a policy changes reaction pressure before concentrations fully respond.
+
+The app starts in game mode, and the **Lab mode** button opens the original exploratory simulator described below.
 
 ---
 
@@ -572,15 +602,6 @@ That combination makes it a strong fit for a public-facing chemistry demonstrati
 ---
 
 # License / Use
-
-Add your preferred license here, for example:
-
-- MIT
-- Apache-2.0
-- All rights reserved for event/demo use
-
-Example placeholder:
-
 ```text
 Copyright (c) AI-Lab and ChemiClub
 For educational and demonstration use.

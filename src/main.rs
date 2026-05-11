@@ -30,7 +30,6 @@ fn main() {
         }))
         .add_plugins(EguiPlugin)
         .init_resource::<SimState>()
-        .init_resource::<MechanismImage>()
         .insert_resource(SurrogateRes::default())
         .add_systems(Startup, (load_surrogate, setup_scene))
         .add_systems(Update, (advance_chemistry, sync_visuals, render_ui).chain())
@@ -49,20 +48,6 @@ struct HistoryPoint {
     no2: f32,
     no: f32,
     voc: f32,
-}
-
-#[derive(Resource)]
-struct MechanismImage {
-    handle: Handle<Image>,
-}
-
-impl FromWorld for MechanismImage {
-    fn from_world(world: &mut World) -> Self {
-        let asset_server = world.resource::<AssetServer>();
-        Self {
-            handle: asset_server.load("smog_mechanism.png"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,7 +116,7 @@ fn card_def(card: CardId) -> CardDef {
             intent: CardIntent::Air,
             duration: 22.0,
             cooldown: 28.0,
-            city_delta: -12.0,
+            city_delta: -6.0,
         },
         CardId::FactoryPause => CardDef {
             name: "Factory Pause",
@@ -141,7 +126,7 @@ fn card_def(card: CardId) -> CardDef {
             intent: CardIntent::Air,
             duration: 12.0,
             cooldown: 24.0,
-            city_delta: -24.0,
+            city_delta: -12.0,
         },
         CardId::VocScrubber => CardDef {
             name: "VOC Scrubber",
@@ -151,7 +136,7 @@ fn card_def(card: CardId) -> CardDef {
             intent: CardIntent::Air,
             duration: 25.0,
             cooldown: 31.0,
-            city_delta: -13.0,
+            city_delta: -7.0,
         },
         CardId::SunlightShield => CardDef {
             name: "Sunlight Shield",
@@ -161,7 +146,7 @@ fn card_def(card: CardId) -> CardDef {
             intent: CardIntent::Air,
             duration: 18.0,
             cooldown: 25.0,
-            city_delta: -11.0,
+            city_delta: -6.0,
         },
         CardId::VentilationCorridor => CardDef {
             name: "Ventilation Corridor",
@@ -171,7 +156,7 @@ fn card_def(card: CardId) -> CardDef {
             intent: CardIntent::Air,
             duration: 24.0,
             cooldown: 30.0,
-            city_delta: -10.0,
+            city_delta: -6.0,
         },
         CardId::HealthAdvisory => CardDef {
             name: "Health Advisory",
@@ -181,7 +166,7 @@ fn card_def(card: CardId) -> CardDef {
             intent: CardIntent::Health,
             duration: 20.0,
             cooldown: 30.0,
-            city_delta: -5.0,
+            city_delta: -3.0,
         },
         CardId::RushHourPriority => CardDef {
             name: "Rush-Hour Priority",
@@ -470,8 +455,11 @@ struct SimState {
     clock_speed: f32,
     step_accumulator: f64,
     history: VecDeque<HistoryPoint>,
+    lock_history_scale: bool,
+    history_scale_max: f32,
     mode: UiMode,
     game: GameState,
+    tutorial_step: Option<usize>,
 }
 
 impl Default for SimState {
@@ -495,8 +483,11 @@ impl Default for SimState {
             clock_speed: 420.0,
             step_accumulator: 0.0,
             history,
+            lock_history_scale: false,
+            history_scale_max: 120.0,
             mode: UiMode::Game,
             game: GameState::default(),
+            tutorial_step: Some(0),
         }
     }
 }
@@ -506,6 +497,9 @@ impl SimState {
         self.chem = ChemState::urban_baseline(self.time_of_day as f64, &self.params);
         self.step_accumulator = 0.0;
         self.history.clear();
+        if !self.lock_history_scale {
+            self.history_scale_max = 120.0;
+        }
         self.push_history_point();
     }
 
@@ -517,6 +511,7 @@ impl SimState {
         self.paused = false;
         self.clock_speed = 420.0;
         self.game.reset();
+        self.tutorial_step = Some(0);
         self.reset_atmosphere();
     }
 
@@ -650,6 +645,10 @@ impl SimState {
         let safety = self.current_air_safety();
         self.game.air_safety_sum += safety * dt;
         self.game.air_safety_time += dt;
+        self.game.city_stability = (self.game.city_stability
+            - incident_stability_pressure(self) * dt
+            - air_quality_stability_pressure(safety) * dt)
+            .clamp(0.0, 100.0);
 
         if self.game.round_elapsed >= ROUND_SECONDS {
             let avg_safety = self.game.average_air_safety();
@@ -881,11 +880,14 @@ fn advance_chemistry(
     mut surrogate: ResMut<SurrogateRes>,
     time: Res<Time>,
 ) {
-    if !state.paused {
+    if !state.paused && state.tutorial_step.is_none() {
         state.tick_game(time.delta_secs());
     }
 
-    if state.paused || (state.mode == UiMode::Game && state.game.round_over) {
+    if state.paused
+        || state.tutorial_step.is_some()
+        || (state.mode == UiMode::Game && state.game.round_over)
+    {
         return;
     }
 
@@ -1064,21 +1066,16 @@ fn render_ui(
     mut ctx: EguiContexts,
     mut state: ResMut<SimState>,
     mut surrogate: ResMut<SurrogateRes>,
-    mechanism_image: Res<MechanismImage>,
-    mut mechanism_texture: Local<Option<egui::TextureId>>,
 ) {
-    let mechanism_texture = *mechanism_texture
-        .get_or_insert_with(|| ctx.add_image(mechanism_image.handle.clone_weak()));
-
     if state.mode == UiMode::Game {
-        render_game_ui(ctx.ctx_mut(), &mut state, mechanism_texture);
+        render_game_ui(ctx.ctx_mut(), &mut state);
         return;
     }
 
     render_lab_ui(ctx.ctx_mut(), &mut state, &mut surrogate);
 }
 
-fn render_game_ui(ctx: &egui::Context, state: &mut SimState, mechanism_texture: egui::TextureId) {
+fn render_game_ui(ctx: &egui::Context, state: &mut SimState) {
     let current_safety = state.current_air_safety();
     let avg_safety = state.game.average_air_safety();
     let final_balance = avg_safety.min(state.game.city_stability);
@@ -1124,6 +1121,9 @@ fn render_game_ui(ctx: &egui::Context, state: &mut SimState, mechanism_texture: 
                         if ui.button("Lab mode").clicked() {
                             state.mode = UiMode::Lab;
                         }
+                        if ui.button("Tutorial").clicked() {
+                            state.tutorial_step = Some(0);
+                        }
                         ui.checkbox(&mut state.paused, "Pause");
                     });
                     ui.separator();
@@ -1148,6 +1148,17 @@ fn render_game_ui(ctx: &egui::Context, state: &mut SimState, mechanism_texture: 
                             ui.colored_label(egui::Color32::from_rgb(235, 145, 70), def.name);
                             ui.label(def.effect);
                             ui.label(def.counter);
+                            if incident_is_countered(state, id) {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(90, 200, 120),
+                                    "Counter active: stability pressure reduced.",
+                                );
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 120, 80),
+                                    "Uncontrolled: city stability is draining.",
+                                );
+                            }
                         }
                     }
 
@@ -1172,7 +1183,8 @@ fn render_game_ui(ctx: &egui::Context, state: &mut SimState, mechanism_texture: 
                         )
                     ));
                     ui.label(format!("Reaction: {}", active_reaction_label(state)));
-                    render_mechanism_panel(ui, state, mechanism_texture);
+                    render_mechanism_panel(ui, state);
+                    render_air_safety_contributions(ui, state);
 
                     ui.separator();
                     ui.heading("Running Policies");
@@ -1221,6 +1233,7 @@ fn render_game_ui(ctx: &egui::Context, state: &mut SimState, mechanism_texture: 
         });
 
     render_policy_choice(ctx, state);
+    render_tutorial_overlay(ctx, state);
 }
 
 fn render_card_button(ui: &mut egui::Ui, state: &mut SimState, hand_index: usize, width: f32) {
@@ -1273,6 +1286,176 @@ fn render_card_button(ui: &mut egui::Ui, state: &mut SimState, hand_index: usize
     });
 }
 
+#[derive(Clone, Copy)]
+struct TutorialStep {
+    title: &'static str,
+    body: &'static str,
+}
+
+const TUTORIAL_STEPS: [TutorialStep; 5] = [
+    TutorialStep {
+        title: "1. Round goal",
+        body: "Watch these three meters. Air Safety comes from chemistry, City Stability comes from policy pressure, and Balance is the final score. Keep both sides high.",
+    },
+    TutorialStep {
+        title: "2. City stage",
+        body: "The stage is a quick visual read of the city. Smog color, traffic, plume, sunlight, and trapped air change as chemistry and incidents move.",
+    },
+    TutorialStep {
+        title: "3. Incidents",
+        body: "Incidents are short shocks: Heat Wave, Traffic Jam, Factory Leak, Cold Snap, Temperature Inversion, Cloud Break, Festival Fireworks, and Wind Shift. The counter line tells which policy type helps.",
+    },
+    TutorialStep {
+        title: "4. Chemistry readout",
+        body: "The mechanism graph shows how O3, NOx, VOC, sun, and mixing push reactions. Red nodes mean high amounts; faster arrows mean faster reaction. The bars below show what is hurting Air Safety most.",
+    },
+    TutorialStep {
+        title: "5. Policy cards",
+        body: "Air cards reduce chemistry drivers but cost stability. City cards recover stability but make chemistry worse. Health cards reduce exposure damage. You have two active slots, and later choices let you replace a card.",
+    },
+];
+
+fn render_tutorial_overlay(ctx: &egui::Context, state: &mut SimState) {
+    let Some(step_index) = state.tutorial_step else {
+        return;
+    };
+    let step_index = step_index.min(TUTORIAL_STEPS.len() - 1);
+    let screen = ctx.screen_rect();
+    let target = tutorial_target_rect(screen, step_index);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("tutorial_focus_layer"),
+    ));
+
+    painter.rect_filled(
+        screen,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 170),
+    );
+    painter.rect_filled(
+        target,
+        8.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+    );
+    painter.rect_stroke(
+        target,
+        8.0,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(245, 205, 85)),
+    );
+
+    let anchor = tutorial_window_anchor(screen, target);
+    egui::Area::new(egui::Id::new("tutorial_card"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(egui::Color32::from_rgb(22, 25, 30))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(85, 95, 110)))
+                .show(ui, |ui| {
+                    ui.set_width(360.0);
+                    let step = TUTORIAL_STEPS[step_index];
+                    ui.heading(step.title);
+                    ui.add_space(4.0);
+                    ui.label(step.body);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}/{}", step_index + 1, TUTORIAL_STEPS.len()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Skip").clicked() {
+                                state.tutorial_step = None;
+                            }
+                            let next_text = if step_index + 1 == TUTORIAL_STEPS.len() {
+                                "Done"
+                            } else {
+                                "Next"
+                            };
+                            if ui.button(next_text).clicked() {
+                                state.tutorial_step = if step_index + 1 == TUTORIAL_STEPS.len() {
+                                    None
+                                } else {
+                                    Some(step_index + 1)
+                                };
+                            }
+                            if ui
+                                .add_enabled(step_index > 0, egui::Button::new("Back"))
+                                .clicked()
+                            {
+                                state.tutorial_step = Some(step_index - 1);
+                            }
+                        });
+                    });
+                });
+        });
+}
+
+fn tutorial_target_rect(screen: egui::Rect, step_index: usize) -> egui::Rect {
+    let right_panel_w = 360.0;
+    let bottom_panel_h = 206.0;
+    let top_bar_h = 42.0;
+    let margin = 8.0;
+
+    match step_index {
+        0 => egui::Rect::from_min_max(
+            screen.left_top() + egui::vec2(margin, margin),
+            egui::pos2(
+                screen.right() - right_panel_w - margin,
+                screen.top() + top_bar_h,
+            ),
+        ),
+        1 => egui::Rect::from_min_max(
+            egui::pos2(screen.left() + 42.0, screen.top() + top_bar_h + 20.0),
+            egui::pos2(
+                screen.right() - right_panel_w - margin,
+                screen.bottom() - bottom_panel_h - margin,
+            ),
+        ),
+        2 => egui::Rect::from_min_max(
+            egui::pos2(
+                screen.right() - right_panel_w + margin,
+                screen.top() + 145.0,
+            ),
+            egui::pos2(screen.right() - margin, screen.top() + 265.0),
+        ),
+        3 => egui::Rect::from_min_max(
+            egui::pos2(
+                screen.right() - right_panel_w + margin,
+                screen.top() + 300.0,
+            ),
+            egui::pos2(
+                screen.right() - margin,
+                screen.bottom() - bottom_panel_h - 24.0,
+            ),
+        ),
+        _ => egui::Rect::from_min_max(
+            egui::pos2(
+                screen.left() + margin,
+                screen.bottom() - bottom_panel_h + margin,
+            ),
+            egui::pos2(
+                screen.right() - right_panel_w - margin,
+                screen.bottom() - margin,
+            ),
+        ),
+    }
+}
+
+fn tutorial_window_anchor(screen: egui::Rect, target: egui::Rect) -> egui::Pos2 {
+    let card_w = 380.0;
+    let card_h = 190.0;
+    let margin = 18.0;
+    let mut x = target.right() + margin;
+    if x + card_w > screen.right() {
+        x = target.left() - card_w - margin;
+    }
+    if x < screen.left() + margin {
+        x = screen.center().x - card_w / 2.0;
+    }
+
+    let mut y = target.center().y - card_h / 2.0;
+    y = y.clamp(screen.top() + margin, screen.bottom() - card_h - margin);
+    egui::pos2(x, y)
+}
+
 fn card_icon(def: &CardDef) -> &'static str {
     if def.city_delta > 0.0 {
         "♥"
@@ -1285,98 +1468,305 @@ fn card_icon(def: &CardDef) -> &'static str {
     }
 }
 
-fn render_mechanism_panel(ui: &mut egui::Ui, state: &SimState, texture_id: egui::TextureId) {
+#[derive(Clone, Copy)]
+struct ReactionVisual {
+    label: &'static str,
+    inputs: [(&'static str, f32); 3],
+    product: (&'static str, f32),
+    rate: f32,
+}
+
+fn render_mechanism_panel(ui: &mut egui::Ui, state: &SimState) {
     let width = ui.available_width().max(240.0);
-    let image_size = egui::vec2(width, 132.0);
-    let response = ui.add(
-        egui::Image::new(egui::load::SizedTexture::new(texture_id, image_size))
-            .fit_to_exact_size(image_size),
-    );
-    let rect = response.rect;
+    let desired_size = egui::vec2(width, 206.0);
+    let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
-    let (score, severity, label) = mechanism_deviation(state);
-    let direction = if score >= 0.0 {
-        egui::vec2(1.0, -0.55)
-    } else {
-        egui::vec2(-1.0, 0.55)
-    }
-    .normalized();
-    let length = 26.0 + 58.0 * severity;
-    let start = rect.center() + egui::vec2(10.0, 16.0) - direction * (length * 0.38);
-    let end = start + direction * length;
-    let arrow_color = if score >= 0.0 {
-        egui::Color32::from_rgb(245, 185, 70)
-    } else {
-        egui::Color32::from_rgb(95, 190, 235)
-    };
-    let stroke = egui::Stroke::new(3.0 + 2.5 * severity, arrow_color);
-    painter.line_segment([start, end], stroke);
-
-    let side = egui::vec2(-direction.y, direction.x);
-    let head_len = 10.0 + 7.0 * severity;
-    painter.line_segment(
-        [end, end - direction * head_len + side * head_len * 0.55],
-        stroke,
-    );
-    painter.line_segment(
-        [end, end - direction * head_len - side * head_len * 0.55],
-        stroke,
-    );
-
-    let label_rect = egui::Rect::from_min_size(
-        rect.left_bottom() + egui::vec2(8.0, -28.0),
-        egui::vec2(rect.width() - 16.0, 22.0),
-    );
     painter.rect_filled(
-        label_rect,
-        4.0,
-        egui::Color32::from_rgba_unmultiplied(8, 12, 18, 190),
+        rect,
+        6.0,
+        egui::Color32::from_rgba_unmultiplied(13, 18, 24, 210),
+    );
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 58, 68)),
     );
     painter.text(
-        label_rect.left_center() + egui::vec2(8.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        label,
+        rect.left_top() + egui::vec2(10.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        "Mechanism",
         egui::TextStyle::Small.resolve(ui.style()),
-        arrow_color,
+        egui::Color32::from_rgb(180, 190, 200),
+    );
+
+    let reactions = reaction_visuals(state);
+    let row_top = rect.top() + 34.0;
+    let row_h = 52.0;
+    for (i, reaction) in reactions.iter().enumerate() {
+        let y = row_top + i as f32 * row_h;
+        draw_reaction_row(ui, &painter, rect, y, *reaction, state.game.round_elapsed);
+    }
+}
+
+fn reaction_visuals(state: &SimState) -> [ReactionVisual; 3] {
+    let params = state.effective_params();
+    let hour = state.time_of_day as f64;
+    let solar = (solar_arc(hour) * params.solar_flux) as f32;
+    let temp_f = temperature_factor(params.temperature_c) as f32;
+    let humid_f = humidity_factor(params.humidity) as f32;
+    let no2 = state.chem.no2 as f32;
+    let no = state.chem.no as f32;
+    let o3 = state.chem.o3 as f32;
+    let voc = state.chem.voc as f32;
+    let nox = no + no2;
+
+    let photolysis = ((j1(hour, params.solar_flux) as f32 * no2) / 0.55).clamp(0.0, 1.0);
+    let titration = ((0.025 * no * o3) / 90.0).clamp(0.0, 1.0);
+    let voc_chain = ((0.0022 * no * voc.max(0.0).sqrt() * solar.powf(0.8) * temp_f * humid_f)
+        / 1.8)
+        .clamp(0.0, 1.0);
+
+    [
+        ReactionVisual {
+            label: "photolysis",
+            inputs: [
+                ("NO2", scale_level(no2, 120.0)),
+                ("sun", scale_level(solar, 1.2)),
+                ("NO", scale_level(no, 90.0)),
+            ],
+            product: ("O3", scale_level(o3, 120.0)),
+            rate: photolysis,
+        },
+        ReactionVisual {
+            label: "titration",
+            inputs: [
+                ("NO", scale_level(no, 90.0)),
+                ("O3", scale_level(o3, 120.0)),
+                ("dark", scale_level(1.0 - solar, 1.0)),
+            ],
+            product: ("NO2", scale_level(no2, 120.0)),
+            rate: titration,
+        },
+        ReactionVisual {
+            label: "VOC chain",
+            inputs: [
+                ("VOC", scale_level(voc, 420.0)),
+                ("NOx", scale_level(nox, 220.0)),
+                ("sun", scale_level(solar, 1.2)),
+            ],
+            product: ("O3", scale_level(o3, 120.0)),
+            rate: voc_chain,
+        },
+    ]
+}
+
+fn draw_reaction_row(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    panel: egui::Rect,
+    y: f32,
+    reaction: ReactionVisual,
+    elapsed: f32,
+) {
+    let left = panel.left() + 10.0;
+    let node_w = ((panel.width() - 174.0) / 4.0).clamp(42.0, 66.0);
+    let node_h = 24.0;
+    let gap = 5.0;
+    let mut x = left;
+
+    painter.text(
+        egui::pos2(left, y - 12.0),
+        egui::Align2::LEFT_CENTER,
+        reaction.label,
+        egui::TextStyle::Small.resolve(ui.style()),
+        egui::Color32::from_rgb(130, 140, 150),
+    );
+
+    for (label, level) in reaction.inputs {
+        draw_species_node(
+            ui,
+            painter,
+            egui::pos2(x, y + 9.0),
+            node_w,
+            node_h,
+            label,
+            level,
+        );
+        x += node_w + gap;
+    }
+
+    let arrow_start = egui::pos2(x + 4.0, y + 9.0);
+    let arrow_end = egui::pos2(panel.right() - node_w - 20.0, y + 9.0);
+    draw_rate_arrow(ui, painter, arrow_start, arrow_end, reaction.rate, elapsed);
+    draw_species_node(
+        ui,
+        painter,
+        egui::pos2(panel.right() - node_w - 10.0, y + 9.0),
+        node_w,
+        node_h,
+        reaction.product.0,
+        reaction.product.1,
     );
 }
 
-fn mechanism_deviation(state: &SimState) -> (f32, f32, &'static str) {
-    let params = state.effective_params();
-    let hour = state.time_of_day as f64;
-    let nox = (state.chem.no + state.chem.no2) as f32;
-    let o3 = state.chem.o3 as f32;
-    let voc = state.chem.voc as f32;
-    let sun = (solar_arc(hour) * params.solar_flux) as f32;
-    let mix = mixing_coeff(
-        hour,
-        params.solar_flux,
-        params.wind_speed,
-        params.inversion_strength,
-    ) as f32;
+fn draw_species_node(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    center_left: egui::Pos2,
+    width: f32,
+    height: f32,
+    label: &str,
+    level: f32,
+) {
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(center_left.x, center_left.y - height / 2.0),
+        egui::vec2(width, height),
+    );
+    painter.rect_filled(
+        rect,
+        5.0,
+        egui::Color32::from_rgba_unmultiplied(22, 28, 34, 235),
+    );
+    painter.rect_stroke(
+        rect,
+        5.0,
+        egui::Stroke::new(1.0, concentration_color(level)),
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::TextStyle::Small.resolve(ui.style()),
+        concentration_color(level),
+    );
+}
 
-    let o3_bias = (o3 - 55.0) / 70.0;
-    let nox_bias = (nox - 120.0) / 240.0;
-    let voc_bias = (voc - 150.0) / 260.0;
-    let sun_bias = (sun - 0.45) / 0.75;
-    let low_mix_bias = (0.00022 - mix) / 0.00022;
-    let score = (0.36 * o3_bias
-        + 0.24 * nox_bias
-        + 0.16 * voc_bias
-        + 0.14 * sun_bias
-        + 0.10 * low_mix_bias)
-        .clamp(-1.0, 1.0);
-    let severity = score.abs().clamp(0.0, 1.0);
-    let label = if score > 0.18 {
-        "High side: ozone-forming pressure"
-    } else if score < -0.18 {
-        "Low side: clearing / night-storage pressure"
+fn draw_rate_arrow(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    rate: f32,
+    elapsed: f32,
+) {
+    let rate = rate.clamp(0.0, 1.0);
+    let color = rate_color(rate);
+    let track_stroke = egui::Stroke::new(1.4, egui::Color32::from_rgb(62, 76, 90));
+    let active_stroke = egui::Stroke::new(2.0, color);
+    painter.line_segment([start, end], track_stroke);
+    painter.line_segment([end, end + egui::vec2(-9.0, -5.0)], active_stroke);
+    painter.line_segment([end, end + egui::vec2(-9.0, 5.0)], active_stroke);
+
+    let delta = end - start;
+    let length = delta.length();
+    if length <= 1.0 {
+        return;
+    }
+
+    let dir = delta / length;
+    let side = egui::vec2(-dir.y, dir.x);
+    let marker_count = 4;
+    let speed = 0.08 + 5.2 * rate.powf(1.45);
+    let marker_len = 7.0;
+    let marker_width = 4.5;
+    for i in 0..marker_count {
+        let phase = (elapsed * speed + i as f32 / marker_count as f32).fract();
+        let pos = start.lerp(end, phase);
+        let tail = pos - dir * marker_len;
+        painter.line_segment([pos, tail + side * marker_width], active_stroke);
+        painter.line_segment([pos, tail - side * marker_width], active_stroke);
+    }
+
+    let speed_label = if rate < 0.28 {
+        "slow"
+    } else if rate < 0.66 {
+        "medium"
     } else {
-        "Near balance"
+        "fast"
     };
+    painter.text(
+        start.lerp(end, 0.5) + egui::vec2(0.0, -12.0),
+        egui::Align2::CENTER_CENTER,
+        speed_label,
+        egui::TextStyle::Small.resolve(ui.style()),
+        color,
+    );
+}
 
-    (score, severity, label)
+fn scale_level(value: f32, high: f32) -> f32 {
+    (value / high).clamp(0.0, 1.0)
+}
+
+fn concentration_color(level: f32) -> egui::Color32 {
+    let level = level.clamp(0.0, 1.0);
+    let r = 245;
+    let gb = (245.0 - 180.0 * level) as u8;
+    egui::Color32::from_rgb(r, gb, gb)
+}
+
+fn rate_color(rate: f32) -> egui::Color32 {
+    let rate = rate.clamp(0.0, 1.0);
+    let r = (80.0 + 175.0 * rate) as u8;
+    let g = (170.0 - 65.0 * rate) as u8;
+    let b = (230.0 - 150.0 * rate) as u8;
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn render_air_safety_contributions(ui: &mut egui::Ui, state: &SimState) {
+    let params = state.effective_params();
+    let parts = safety_contributions(&state.chem, &params, state.time_of_day as f64);
+    ui.add_space(5.0);
+    ui.label("Air safety drivers");
+    contribution_bar(
+        ui,
+        "O3 direct",
+        parts.o3,
+        0.50,
+        egui::Color32::from_rgb(230, 190, 70),
+    );
+    contribution_bar(
+        ui,
+        "NO2 exposure",
+        parts.no2,
+        0.25,
+        egui::Color32::from_rgb(225, 120, 70),
+    );
+    contribution_bar(
+        ui,
+        "VOC+NOx+sun",
+        parts.chain,
+        0.15,
+        egui::Color32::from_rgb(190, 105, 220),
+    );
+    contribution_bar(
+        ui,
+        "VOC background",
+        parts.voc,
+        0.10,
+        egui::Color32::from_rgb(150, 110, 210),
+    );
+}
+
+fn contribution_bar(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: f32,
+    max_value: f32,
+    color: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        ui.set_height(18.0);
+        ui.label(egui::RichText::new(label).small());
+        let width = (ui.available_width() - 42.0).max(80.0);
+        ui.add(
+            egui::ProgressBar::new((value / max_value).clamp(0.0, 1.0))
+                .fill(color)
+                .desired_width(width)
+                .show_percentage(),
+        );
+        ui.label(egui::RichText::new(format!("{:.0}", value * 100.0)).small());
+    });
 }
 
 fn render_policy_choice(ctx: &egui::Context, state: &mut SimState) {
@@ -1558,7 +1948,23 @@ fn render_lab_ui(ctx: &egui::Context, state: &mut SimState, surrogate: &mut Surr
 
                     ui.separator();
                     ui.heading("Recent concentration history");
-                    draw_history_plot(ui, &state.history);
+                    let current_scale = history_auto_scale(&state.history);
+                    let mut lock_scale = state.lock_history_scale;
+                    if ui
+                        .checkbox(&mut lock_scale, "Lock current scale")
+                        .changed()
+                    {
+                        state.lock_history_scale = lock_scale;
+                        if lock_scale {
+                            state.history_scale_max = current_scale;
+                        }
+                    }
+                    let scale_max = if state.lock_history_scale {
+                        state.history_scale_max.max(1.0)
+                    } else {
+                        current_scale
+                    };
+                    draw_history_plot(ui, &state.history, scale_max);
 
                     ui.separator();
                     ui.collapsing("How to read the demo", |ui| {
@@ -1642,12 +2048,90 @@ fn apply_incident_effect(id: IncidentId, params: &mut SmogParams) {
     }
 }
 
+fn incident_stability_pressure(state: &SimState) -> f32 {
+    state
+        .active_incident_ids()
+        .into_iter()
+        .map(|id| {
+            let base = match id {
+                IncidentId::HeatWave => 0.15,
+                IncidentId::TrafficJam => 0.20,
+                IncidentId::FactoryLeak => 0.22,
+                IncidentId::ColdSnap => 0.17,
+                IncidentId::TemperatureInversion => 0.21,
+                IncidentId::CloudBreak => 0.14,
+                IncidentId::FestivalFireworks => 0.18,
+                IncidentId::WindShift => 0.16,
+            };
+            if incident_is_countered(state, id) {
+                base * 0.25
+            } else {
+                base
+            }
+        })
+        .sum()
+}
+
+fn incident_is_countered(state: &SimState, id: IncidentId) -> bool {
+    match id {
+        IncidentId::HeatWave | IncidentId::CloudBreak => {
+            state.is_card_running(CardId::SunlightShield)
+                || state.is_card_running(CardId::VocScrubber)
+                || state.is_card_running(CardId::FactoryPause)
+        }
+        IncidentId::TrafficJam | IncidentId::ColdSnap => {
+            state.is_card_running(CardId::TrafficLimit)
+                || state.is_card_running(CardId::VentilationCorridor)
+        }
+        IncidentId::FactoryLeak => {
+            state.is_card_running(CardId::VocScrubber)
+                || state.is_card_running(CardId::FactoryPause)
+        }
+        IncidentId::TemperatureInversion | IncidentId::WindShift => {
+            state.is_card_running(CardId::VentilationCorridor)
+        }
+        IncidentId::FestivalFireworks => {
+            state.is_card_running(CardId::HealthAdvisory)
+                || state.is_card_running(CardId::VentilationCorridor)
+        }
+    }
+}
+
+fn air_quality_stability_pressure(safety: f32) -> f32 {
+    if safety >= 72.0 {
+        0.0
+    } else {
+        ((72.0 - safety) / 72.0 * 0.18).clamp(0.0, 0.18)
+    }
+}
+
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
+#[derive(Clone, Copy)]
+struct SafetyContributions {
+    o3: f32,
+    no2: f32,
+    chain: f32,
+    voc: f32,
+}
+
+impl SafetyContributions {
+    fn hazard(self) -> f32 {
+        self.o3 + self.no2 + self.chain + self.voc
+    }
+}
+
 fn air_safety_index(chem: &ChemState, params: &SmogParams, hour: f64, protection: f32) -> f32 {
+    let mut hazard = safety_contributions(chem, params, hour).hazard();
+    hazard *= 1.0 - protection.clamp(0.0, 0.35);
+
+    (100.0 - 100.0 * hazard).clamp(0.0, 100.0)
+}
+
+fn safety_contributions(chem: &ChemState, params: &SmogParams, hour: f64) -> SafetyContributions {
     let o3 = chem.o3 as f32;
     let no2 = chem.no2 as f32;
     let nox = (chem.no + chem.no2) as f32;
@@ -1659,10 +2143,12 @@ fn air_safety_index(chem: &ChemState, params: &SmogParams, hour: f64, protection
     let voc_risk = smoothstep(120.0, 450.0, voc);
     let chain_risk = voc_risk * smoothstep(30.0, 140.0, nox) * sunlight;
 
-    let mut hazard = 0.50 * o3_risk + 0.25 * no2_risk + 0.15 * chain_risk + 0.10 * voc_risk;
-    hazard *= 1.0 - protection.clamp(0.0, 0.35);
-
-    (100.0 - 100.0 * hazard).clamp(0.0, 100.0)
+    SafetyContributions {
+        o3: 0.50 * o3_risk,
+        no2: 0.25 * no2_risk,
+        chain: 0.15 * chain_risk,
+        voc: 0.10 * voc_risk,
+    }
 }
 
 fn meter(ui: &mut egui::Ui, label: &str, value: f32, color: egui::Color32) {
@@ -1800,7 +2286,13 @@ fn scenario_narrative(state: &SimState) -> &'static str {
     }
 }
 
-fn draw_history_plot(ui: &mut egui::Ui, history: &VecDeque<HistoryPoint>) {
+fn history_auto_scale(history: &VecDeque<HistoryPoint>) -> f32 {
+    history.iter().fold(120.0_f32, |acc, p| {
+        acc.max(p.o3).max(p.no2).max(p.no).max(p.voc * 0.35)
+    })
+}
+
+fn draw_history_plot(ui: &mut egui::Ui, history: &VecDeque<HistoryPoint>, max_y: f32) {
     let desired_size = egui::vec2(ui.available_width(), 160.0);
     let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter();
@@ -1816,9 +2308,7 @@ fn draw_history_plot(ui: &mut egui::Ui, history: &VecDeque<HistoryPoint>) {
         return;
     }
 
-    let max_y = history.iter().fold(120.0_f32, |acc, p| {
-        acc.max(p.o3).max(p.no2).max(p.no).max(p.voc * 0.35)
-    });
+    let max_y = max_y.max(1.0);
 
     let to_pos = |i: usize, value: f32| {
         let x = rect.left() + rect.width() * (i as f32 / (history.len() - 1) as f32);
