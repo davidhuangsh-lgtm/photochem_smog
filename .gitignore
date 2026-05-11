@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+
+# Local Codex/session files
+/.codex
+
+# Python local environments and caches
+/.venv/
+/venv/
+/env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
