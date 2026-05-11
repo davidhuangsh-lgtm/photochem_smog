@@ -61,7 +61,12 @@ impl ChemState {
             no2: (12.0 + 19.0 * rush + 10.0 * industry * trap).clamp(3.0, 150.0),
             no: (8.0 + 25.0 * rush * trap).clamp(1.0, 140.0),
             o3: (6.0 + 16.0 * day + 6.0 * p.wind_speed + 5.0 * industry).clamp(0.0, 90.0),
-            voc: (38.0 + 80.0 * rush + 85.0 * industry).clamp(15.0, 420.0),
+            voc: (38.0
+                + 80.0 * rush
+                + 85.0 * industry
+                + 4.0 * p.humidity
+                + 0.8 * (p.temperature_c - 20.0).max(0.0))
+            .clamp(15.0, 420.0),
         }
     }
 }
@@ -100,15 +105,32 @@ pub fn j1(hour: f64, solar_flux: f64) -> f64 {
     J1_MAX * solar_arc(hour).powf(1.25) * solar_flux
 }
 
+pub fn traffic_time_factor(hour: f64, weekend_mode: bool) -> f64 {
+    let morning = gaussian_wrap(hour, 8.0, if weekend_mode { 1.45 } else { 1.1 });
+    let evening = gaussian_wrap(hour, 17.5, if weekend_mode { 1.7 } else { 1.25 });
+    let midday = gaussian_wrap(hour, 12.8, 2.5);
+    let midnight = gaussian_wrap(hour, 0.2, 2.3);
+
+    let weekday_profile =
+        (0.12 + 0.76 * morning + 0.72 * evening + 0.36 * midday) * (1.0 - 0.82 * midnight);
+    let weekend_profile =
+        (0.10 + 0.42 * morning + 0.52 * evening + 0.34 * midday) * (1.0 - 0.78 * midnight);
+    let profile = if weekend_mode {
+        weekend_profile
+    } else {
+        weekday_profile
+    };
+    profile.clamp(0.05, 1.0)
+}
+
+pub fn effective_traffic_density(hour: f64, traffic_density: f64, weekend_mode: bool) -> f64 {
+    traffic_density * traffic_time_factor(hour, weekend_mode)
+}
+
 pub fn traffic_profile(hour: f64, traffic_density: f64, weekend_mode: bool) -> f64 {
-    let weekend_scale = if weekend_mode { 0.68 } else { 1.0 };
-    let base = (0.22 + 0.42 * traffic_density) * if weekend_mode { 0.78 } else { 1.0 };
-    let morning = (0.58 + 0.92 * traffic_density)
-        * gaussian_wrap(hour, 8.0, if weekend_mode { 1.3 } else { 0.9 });
-    let evening = (0.44 + 0.74 * traffic_density)
-        * gaussian_wrap(hour, 17.6, if weekend_mode { 1.4 } else { 1.1 });
-    let midday = (0.10 + 0.18 * traffic_density) * gaussian_wrap(hour, 13.0, 2.4);
-    weekend_scale * (base + morning + evening + midday)
+    let density_now = effective_traffic_density(hour, traffic_density, weekend_mode);
+    let weekend_scale = if weekend_mode { 0.88 } else { 1.0 };
+    weekend_scale * (0.08 + 1.70 * density_now)
 }
 
 pub fn mixing_coeff(hour: f64, solar_flux: f64, wind_speed: f64, inversion_strength: f64) -> f64 {
@@ -133,19 +155,20 @@ pub fn humidity_factor(humidity: f64) -> f64 {
 
 pub fn background_state(hour: f64, p: &SmogParams) -> ChemState {
     let weekend_bias = if p.weekend_mode { 0.85 } else { 1.0 };
+    let traffic_now = effective_traffic_density(hour, p.traffic_density, p.weekend_mode);
     ChemState {
         no2: (2.0
-            + 2.2 * gaussian_wrap(hour, 7.0, 1.8)
+            + 2.4 * gaussian_wrap(hour, 7.0, 1.8)
             + 5.0 * p.industrial_emissions * weekend_bias)
             .clamp(0.5, 35.0),
-        no: (0.3 + 1.0 * gaussian_wrap(hour, 8.0, 1.0) + 0.8 * gaussian_wrap(hour, 18.0, 1.2))
+        no: (0.2 + 0.85 * gaussian_wrap(hour, 8.0, 1.0) + 0.65 * gaussian_wrap(hour, 18.0, 1.2))
             .clamp(0.0, 10.0),
         o3: (10.0
             + 16.0 * solar_arc(hour) * p.solar_flux
             + 11.0 * p.wind_speed
             + 3.0 * p.temperature_c / 30.0)
             .clamp(4.0, 70.0),
-        voc: (16.0 + 9.0 * p.traffic_density + 28.0 * p.industrial_emissions).clamp(8.0, 130.0),
+        voc: (14.0 + 10.0 * traffic_now + 28.0 * p.industrial_emissions).clamp(8.0, 130.0),
     }
 }
 

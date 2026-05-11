@@ -3,6 +3,11 @@ use ort::value::Tensor;
 
 use crate::chemistry::{ChemState, SmogParams};
 
+fn hour_features(hour: f64) -> (f32, f32) {
+    let theta = std::f64::consts::TAU * (hour.rem_euclid(24.0) / 24.0);
+    (theta.sin() as f32, theta.cos() as f32)
+}
+
 pub struct NNSurrogate {
     session: Session,
 }
@@ -20,6 +25,7 @@ impl NNSurrogate {
         params: &SmogParams,
         hour: f64,
     ) -> Option<ChemState> {
+        let (hour_sin, hour_cos) = hour_features(hour);
         let data: Vec<f32> = vec![
             state.no2 as f32,
             state.no as f32,
@@ -33,10 +39,11 @@ impl NNSurrogate {
             params.industrial_emissions as f32,
             params.inversion_strength as f32,
             if params.weekend_mode { 1.0 } else { 0.0 },
-            hour as f32,
+            hour_sin,
+            hour_cos,
         ];
 
-        let ort_input = Tensor::<f32>::from_array(([1usize, 13usize], data)).ok()?;
+        let ort_input = Tensor::<f32>::from_array(([1usize, 14usize], data)).ok()?;
         let outputs = self.session.run(ort::inputs!["input" => ort_input]).ok()?;
         let (_, raw) = outputs["output"].try_extract_tensor::<f32>().ok()?;
 
